@@ -661,8 +661,9 @@ A desert castle would be made of sandstone rather then cobblestone, thus we need
 
 > plazaSkyscraper :: Int -> Int -> Int -> Int -> Blocks
 > plazaSkyscraper plazaRadius floors circum height = mconcat
->   [ skyscraper floors circum height & translate plazaRadius 0 plazaRadius
->   , wideSquare plazaRadius (circum + plazaRadius * 2) # smooth_stone
+>   [ wideSquare plazaRadius (circum + plazaRadius * 2) # smooth_stone
+>   , replicate y 1 10 (wideSquare plazaRadius (circum + plazaRadius * 2)) # air
+>   , skyscraper floors circum height & translate plazaRadius 0 plazaRadius
 >   ]
 
 > skyscraper :: Int -> Int -> Int -> Blocks
@@ -767,6 +768,7 @@ Stairs! And space for the stairs.
 > plazaRoundSkyscraper :: Int -> Int -> Int -> Int -> Blocks
 > plazaRoundSkyscraper plazaRadius radius floors height = mconcat
 >   [ floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius)) # smooth_stone
+>   , replicate y 1 10 (floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius))) # air
 >   , roundSkyscraper radius floors height
 >       & translate plazaRadius 0 plazaRadius
 >   ]
@@ -886,12 +888,14 @@ Add a street which we build around.
 >           <$> randomRIO (5, 15)
 >           <*> pure (size - plazaR * 2)
 >           <*> randomRIO (5, 9)
+>
 >     , \size -> do
 >         plazaR <- randomRIO $ plazaRange size
 >         plazaRoundSkyscraper plazaR
 >           <$> pure ((size - plazaR * 2) `div` 2)
 >           <*> randomRIO (5, 15)
 >           <*> randomRIO (5, 9)
+>
 >     , \size -> do
 >         plazaR <- randomRIO $ plazaRange size
 >         plazaPool plazaR 
