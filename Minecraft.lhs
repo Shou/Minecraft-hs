@@ -295,7 +295,8 @@ Before we generate the mcfunction file, we first prune the block list to get rid
 Finally here is the "render" function for generating the commands:
 
 > render :: FilePath -> String -> String -> Coord -> Blocks -> IO ()
-> render minecraftDir levelName functionName Coord{..} (prune -> blocks) =
+> render minecraftDir levelName functionName Coord{..} (prune -> blocks) = do
+>     writeFile mcmetaFile packMcMeta
 >     withFile filePath WriteMode $ \hnd ->
 >         let isRelative = _x == 0 && _y == 0 && _z == 0
 >         in forM_ (unBlocks $ translate _x _y _z blocks) $ \(Block Coord{..} kind mstate) ->
@@ -306,6 +307,11 @@ Finally here is the "render" function for generating the commands:
 >     filePath = foldr @[] (</>) (functionName ++ ".mcfunction")
 >                    [ minecraftDir, "saves", levelName, "datapacks"
 >                    , "haskell", "data", "haskell",  "functions" ]
+>     mcmetaFile = foldr1 @[] (</>)
+>       [ minecraftDir, "saves", levelName, "datapacks"
+>       , "haskell", "pack.mcmeta"
+>       ]
+>     packMcMeta = "{\"pack\": {\"pack_format\": 1, \"description\": \"Haskell functions\" } }"
 
 > renderToFlatpak = render "/home/benedict/.var/app/com.mojang.Minecraft/.minecraft/"
 > renderRelative name = renderToFlatpak "Haskell" name (Coord 0 0 0)
@@ -774,10 +780,25 @@ Stairs! And space for the stairs.
 
 > roundSkyscraper :: Int -> Int -> Int -> Blocks
 > roundSkyscraper radius floors height = mconcat
+
+Cool black glass exterior.
+
 >   [ circleWall radius (floors * height) (radius * 2 * 4) # "black_stained_glass"
+
+Every floor's flooring
+
 >   , [0, height .. floors * height] & foldMap @[] \n -> circleFloor' radius # smooth_stone & move y n
+
+Roof?
+
 >   , circleFloor' radius # smooth_stone & move y (floors * height + 1)
+
+Carpet!
+
 >   , [0, height .. floors * height - height] & foldMap @[] \n -> circleFloor' (radius - 1) # light_gray_carpet & translate 1 (succ n) 1
+
+Spiral staircase.
+
 >   , wideSlabSpiral (radius - 1) 3 (floors * height) (floors `div` 2) (radius * 4 * 3 * floors)
 >       & translate 1 1 1
 >       & overN @Blocks @[Block] \blocks -> flip (foldMap @[]) blocks \block ->
@@ -786,13 +807,16 @@ Stairs! And space for the stairs.
 >                   & over blockKind (const air)
 >                   & over blockState (const Nothing)
 >           in space <> [block]
+
+Ceiling lights.
+
 >   , [height, height * 2 .. floors * height] & foldMap @[] \y' ->
 >       takeWhile (>0) (iterate (subtract 5) (radius - 5)) & foldMap @[] \r -> mconcat
 >         [ circle r (r * 2 * 4) # glowstone & move y y'
 >         , circle r (r * 2 * 4) # white_stained_glass & move y (pred y')
 >         ] & translate (radius - r) 0 (radius - r)
 
-Doors
+Entrances
 
 >   , wall z (radius `div` 4 + 1) (height - 3) # air & translate 0 1 (radius - 1)
 >   , replicate y 1 2 (circle radius (radius * 2 * 6) # smooth_stone) & move y (floors * height + 1)
