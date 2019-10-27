@@ -38,6 +38,7 @@ Before we model the above in Haskell, let's enable some extensions and import so
 > import           Prelude hiding (repeat, replicate, floor)
 > import qualified Prelude as Prelude
 > import           Control.Arrow
+> import qualified Control.Exception as Except
 > import           Control.Lens (Lens', view, over, set, makeLenses)
 > import           Control.Monad
 > import qualified Control.Monad.Trans.State as State
@@ -46,6 +47,7 @@ Before we model the above in Haskell, let's enable some extensions and import so
 > import Data.Coerce
 > import Data.Fixed (mod')
 > import qualified Debug.Trace as Trace
+> import qualified System.Directory as Dir
 > import           System.FilePath
 > import           System.IO
 > import           System.Random
@@ -296,6 +298,8 @@ Finally here is the "render" function for generating the commands:
 
 > render :: FilePath -> String -> String -> Coord -> Blocks -> IO ()
 > render minecraftDir levelName functionName Coord{..} (prune -> blocks) = do
+>     void $ Except.try @Except.SomeException do
+>       forM_ (scanl1 (</>) folderPath) Dir.createDirectory
 >     writeFile mcmetaFile packMcMeta
 >     withFile filePath WriteMode $ \hnd ->
 >         let isRelative = _x == 0 && _y == 0 && _z == 0
@@ -304,9 +308,11 @@ Finally here is the "render" function for generating the commands:
 >           in hPutStrLn hnd $ printf "setblock %s %s %s %s[%s]"
 >               (shower _x) (shower _y) (shower _z) kind (foldMap id mstate)
 >   where
->     filePath = foldr @[] (</>) (functionName ++ ".mcfunction")
->                    [ minecraftDir, "saves", levelName, "datapacks"
->                    , "haskell", "data", "haskell",  "functions" ]
+>     folderPath =
+>       [ minecraftDir, "saves", levelName, "datapacks"
+>       , "haskell", "data", "haskell",  "functions"
+>       ]
+>     filePath = foldr @[] (</>) (functionName ++ ".mcfunction") folderPath
 >     mcmetaFile = foldr1 @[] (</>)
 >       [ minecraftDir, "saves", levelName, "datapacks"
 >       , "haskell", "pack.mcmeta"
