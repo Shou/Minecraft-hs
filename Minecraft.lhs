@@ -298,8 +298,9 @@ Finally here is the "render" function for generating the commands:
 
 > render :: FilePath -> String -> String -> Coord -> Blocks -> IO ()
 > render minecraftDir levelName functionName Coord{..} (prune -> blocks) = do
->     void $ Except.try @Except.SomeException do
->       forM_ (scanl1 (</>) folderPath) Dir.createDirectory
+>     either (const mempty) (const $ print "Made datapack directory") <$> do
+>       Except.try @Except.SomeException do
+>         forM_ (scanl1 (</>) folderPath) Dir.createDirectory
 >     writeFile mcmetaFile packMcMeta
 >     withFile filePath WriteMode $ \hnd ->
 >         let isRelative = _x == 0 && _y == 0 && _z == 0
