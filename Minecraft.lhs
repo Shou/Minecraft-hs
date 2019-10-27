@@ -43,7 +43,6 @@ Before we model the above in Haskell, let's enable some extensions and import so
 > import qualified Control.Monad.Trans.State as State
 > import qualified Control.Monad.IO.Class as IO
 > import qualified Control.Monad.Loops as Loops
-> import qualified Control.Newtype as Newtype
 > import Data.Coerce
 > import Data.Fixed (mod')
 > import qualified Debug.Trace as Trace
@@ -661,8 +660,8 @@ A desert castle would be made of sandstone rather then cobblestone, thus we need
 
 > plazaSkyscraper :: Int -> Int -> Int -> Int -> Blocks
 > plazaSkyscraper plazaRadius floors circum height = mconcat
->   [ wideSquare plazaRadius (circum + plazaRadius * 2) # smooth_stone
->   , replicate y 1 10 (wideSquare plazaRadius (circum + plazaRadius * 2)) # air
+>   [ replicate y 1 10 (wideSquare plazaRadius (circum + plazaRadius * 2)) # air
+>   , wideSquare plazaRadius (circum + plazaRadius * 2) # smooth_stone
 >   , skyscraper floors circum height & translate plazaRadius 0 plazaRadius
 >   ]
 
@@ -767,8 +766,8 @@ Stairs! And space for the stairs.
 
 > plazaRoundSkyscraper :: Int -> Int -> Int -> Int -> Blocks
 > plazaRoundSkyscraper plazaRadius radius floors height = mconcat
->   [ floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius)) # smooth_stone
->   , replicate y 1 10 (floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius))) # air
+>   [ replicate y 1 10 (floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius))) # air
+>   , floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius)) # smooth_stone
 >   , roundSkyscraper radius floors height
 >       & translate plazaRadius 0 plazaRadius
 >   ]
@@ -792,6 +791,9 @@ Stairs! And space for the stairs.
 >         [ circle r (r * 2 * 4) # glowstone & move y y'
 >         , circle r (r * 2 * 4) # white_stained_glass & move y (pred y')
 >         ] & translate (radius - r) 0 (radius - r)
+
+Doors
+
 >   , wall z (radius `div` 4 + 1) (height - 3) # air & translate 0 1 (radius - 1)
 >   , replicate y 1 2 (circle radius (radius * 2 * 6) # smooth_stone) & move y (floors * height + 1)
 >   ]
@@ -895,14 +897,15 @@ Add a street which we build around.
 >           <$> pure ((size - plazaR * 2) `div` 2)
 >           <*> randomRIO (5, 15)
 >           <*> randomRIO (5, 9)
+>           <&> translate 1 0 0
 >
 >     , \size -> do
 >         plazaR <- randomRIO $ plazaRange size
->         plazaPool plazaR 
->           <$> randomRIO (5, 10)
->           <*> pure ((size - plazaR * 2) `div` 2)
->           <*> randomRIO (1, 4)
->           <&> translate size 0 0
+>         width <- randomRIO (5, 10)
+>         plazaPool plazaR width
+>           <$> pure ((size - plazaR * 2) `div` 2)
+>           <*> randomRIO (1, 2)
+>           <&> translate (size - (plazaR * 2 + width)) 0 0
 >     ]
 >   plazaRange s = (5, s `div` 5)
 
