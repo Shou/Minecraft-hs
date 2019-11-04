@@ -30,6 +30,7 @@ Before we model the above in Haskell, let's enable some extensions and import so
 >{-# LANGUAGE TemplateHaskell #-}
 >{-# LANGUAGE ViewPatterns #-}
 >{-# LANGUAGE OverloadedLists #-}
+>{-# LANGUAGE OverloadedStrings #-}
 >{-# LANGUAGE TypeApplications #-}
 >{-# LANGUAGE BlockArguments #-}
 
@@ -40,12 +41,20 @@ Before we model the above in Haskell, let's enable some extensions and import so
 > import           Control.Arrow
 > import qualified Control.Exception as Except
 > import           Control.Lens (Lens', view, over, set, makeLenses)
-> import           Control.Monad
+> import           Control.Monad hiding (guard)
 > import qualified Control.Monad.Trans.State as State
 > import qualified Control.Monad.IO.Class as IO
 > import qualified Control.Monad.Loops as Loops
 > import Data.Coerce
 > import Data.Fixed (mod')
+> import Data.Map.Strict (Map)
+> import qualified Data.Map.Strict as Map
+> import Data.Maybe (isJust)
+> import Data.Text (Text)
+> import qualified Data.Text as Text
+> import qualified Data.Text.IO as Text
+> import Data.Vector (Vector)
+> import qualified Data.Vector as Vector
 > import qualified Debug.Trace as Trace
 > import qualified System.Directory as Dir
 > import           System.FilePath
@@ -53,8 +62,7 @@ Before we model the above in Haskell, let's enable some extensions and import so
 > import           System.Random
 > import           Text.Printf
 > import Data.Functor ((<&>))
-> import qualified Data.Map as Map
-> import Data.Function ((&)) -- only scrubs align their code
+> import Data.Function ((&))
 > import qualified Data.List as List
 
 We will also use lenses to represent the three dimensions. This will allow us to write code that can read and modify an abstracted dimension using only one function parameter, rather than passing getters and setters around. The only lens library functions we will use are as follows:
@@ -70,20 +78,22 @@ Data types
 
 The basic atom in Minecraft is the block. Each block has coordinates, a kind (e.g. air, cobblestone, water) and some optional state (which we won't make use of here).
 
-> type Kind  = String
-> type State = String
+> type Kind  = Text
+> type State = Text
+> type Data = Text
 
 > data Block = Block
->     { _blockCoord :: Coord
+>     { _blockCoord :: Coord Int
 >     , _blockKind  :: Kind
->     , _blockState :: Maybe State
+>     , _blockState :: Map Text State
+>     , _blockData :: Maybe Data
 >     }
 >     deriving Show
 
-> data Coord = Coord { _x :: Int, _y :: Int, _z :: Int }
+> data Coord a = Coord { _x :: a, _y :: a, _z :: a }
 >     deriving (Ord, Eq)
 
-> instance Show Coord where
+> instance Show a => Show (Coord a) where
 >     show (Coord x y z) = show (x, y, z)
 
 > makeLenses ''Coord
@@ -91,21 +101,25 @@ The basic atom in Minecraft is the block. Each block has coordinates, a kind (e.
 
 Minecraft structures are represented as an ordered list of blocks, wrapped in a newtype, in order to hide the underlying representation. We will be working with lists of Blocks soon and so the newtype helps us distinguish between the layers.
 
-> newtype Blocks = Blocks { unBlocks :: [Block] }
+> newtype Blocks = Blocks { unBlocks :: Vector Block }
 >     deriving (Semigroup, Monoid, Show)
 
 > overN :: forall a b . Coercible a b => (b -> b) -> a -> a
 > overN f = coerce @a @b >>> f >>> coerce @b @a
 
-> mkBlocks :: [(Coord, Maybe State)] -> Blocks
-> mkBlocks = Blocks . map (\(c, ms) -> Block c cobblestone ms)
+> guard :: Monoid m => Bool -> m -> m
+> guard True m = m
+> guard False _ = mempty
+
+> mkBlocks :: (Foldable f, Applicative f) => f (Coord Int, Map Text State) -> Blocks
+> mkBlocks = Blocks . foldMap (\(c, ms) -> pure $ Block c cobblestone ms Nothing)
 
 > -- | A block of nothing (air) at the origin (0,0,0)
 > zero :: Blocks
-> zero = Blocks [Block (Coord 0 0 0) air Nothing]
+> zero = Blocks [Block (Coord 0 0 0) air mempty mempty]
 
 > mapBlocks :: (Block -> Block) -> Blocks -> Blocks
-> mapBlocks f = Blocks . map f . unBlocks
+> mapBlocks f = Blocks . fmap f . unBlocks
 
 > (#&) :: (Block -> Block) -> Blocks -> Blocks
 > (#&) = mapBlocks
@@ -120,6 +134,10 @@ We set the kind of block using an infix `#` operator:
 > (#) :: Blocks -> Kind -> Blocks
 > (#) blocks k = mapKind (const k) blocks
 
+> -- | Copy blocks and apply a function to the copy, then mappend the original and copy.
+> copyBlocks :: (Blocks -> Blocks) -> Blocks -> Blocks
+> copyBlocks f b = b <> f b
+
 We derive semigroup and monoid using the underlying list instances. The semantics of the Blocks monoid is that of a non-commutative monoid, the right-hand-side overrides the left. For example:
 
 ~~~{.haskell}
@@ -127,12 +145,25 @@ zero <> (zero # cobblestone) -- results in a cobblestone block at (0,0,0)
 (zero # cobblestone) <> zero -- results in nothing (an air block) at (0,0,0)
 ~~~
 
+
+Monsters
+--------
+
+> mkEntity :: Text -> Float -> Data
+> mkEntity entity speed = mconcat
+>   [ "SpawnData:{id:\"minecraft:"
+>   , entity
+>   , "\",Attributes:[{Name:\"generic.movementSpeed\", Base:"
+>   , Text.pack $ show speed
+>   , "}]}"
+>   ]
+
 Abstracting over dimensions using lenses
 ----------------------------------------
 
 We will abstract over dimensions using lenses:
 
-> type Dimension = Lens' Coord Int
+> type Dimension = Lens' (Coord Int) Int
 
 We have the lenses `x`, `y` and `z` automatically generated for us using Template Haskell. Note that Minecraft uses the convention where `x` and `z` are in the horizontal plane and `y` is the height. This convention continues to confuse me and was the cause of most of the bugs in my structure generation. I follow it here, only to be consistent with Minecraft.
 
@@ -150,7 +181,7 @@ The use of lenses means that we can use a single dimension parameter for functio
 > bounds :: Dimension -> Blocks -> (Int, Int)
 > bounds d blocks = (minimum ps, maximum ps)
 >   where
->     ps = map (view $ blockCoord . d) $ unBlocks blocks
+>     ps = (view $ blockCoord . d) <$> unBlocks blocks
 
 This centering function is particularly useful and is simplified by using a single dimension lens parameter:
 
@@ -205,13 +236,10 @@ Similarly we can define walls, floors and squares of cobblestone:
 >   = replicate x 1 t 
 >   $ wall z w h
 
-> square :: Int -> Blocks
-> square w =
->     l x <> move z (w-1) (l x) <>
->     l z <> move x (w-1) (l z)
->   where
->     l :: Dimension -> Blocks
->     l d = line d w
+> square :: Dimension -> Int -> Blocks
+> square d w =
+>     line x w <> move d (w-1) (line x w) <>
+>     line d w <> move x (w-1) (line d w)
 
 > rect :: Int -> Int -> Blocks
 > rect wx wz = mconcat
@@ -228,12 +256,12 @@ Similarly we can define walls, floors and squares of cobblestone:
 >   ]
 
 > squareWall :: Int -> Int -> Blocks
-> squareWall w h = repeat (move y 1) h (square w)
+> squareWall w h = repeat (move y 1) h (square z w)
 
 > -- | A square of thickness 't' and width 'w'.
 > wideSquare :: Int -> Int -> Blocks
 > wideSquare t w = mconcat
->     [ translate i 0 i $ square (w-2*i)
+>     [ translate i 0 i $ square z (w-2*i)
 >     | i <- [0..t-1]
 >     ]
 
@@ -268,7 +296,7 @@ We now have enough to define a square turret complete with windows and crenellat
 To get this structure into Minecraft, we need to generate an ".mcfunction" text file of commands that can be executed by the game. The only command we will use is "setblock" which takes three coordinates and a block kind. But before Minecraft will load such a file, we need to create a "datapack" inside a particular level. The level I used was called "Castles" and for my Linux machine, Minecraft saved game state was stored in `~/.minecraft`. I created the following directories:
 
 ~~~{.bash}
-[tim@x1c:~/.minecraft/saves/Castle/datapacks]$ find
+tim@x1c:~/.minecraft/saves/Castle/datapacks$ find
 .
 ./haskell
 ./haskell/data
@@ -292,36 +320,38 @@ Before we generate the mcfunction file, we first prune the block list to get rid
 
 > -- | Removes unnecessary setblock instructions from the list.
 > prune :: Blocks -> Blocks
-> prune = Blocks . Map.elems . Map.fromList . map (_blockCoord &&& id) . unBlocks
+> prune = Blocks . Vector.fromList . Map.elems . Map.fromList . fmap (_blockCoord &&& id) . Vector.toList . unBlocks
 
 Finally here is the "render" function for generating the commands:
 
-> render :: FilePath -> String -> String -> Coord -> Blocks -> IO ()
-> render minecraftDir levelName functionName Coord{..} (prune -> blocks) = do
+> render :: FilePath -> FilePath -> Coord Int -> Blocks -> IO ()
+> render saveDir functionName Coord{..} (prune -> blocks) = do
 >     either (const mempty) (const $ print "Made datapack directory") <$> do
 >       Except.try @Except.SomeException do
 >         forM_ (scanl1 (</>) folderPath) Dir.createDirectory
->     writeFile mcmetaFile packMcMeta
+>     Text.writeFile mcmetaFile packMcMeta
 >     withFile filePath WriteMode $ \hnd ->
 >         let isRelative = _x == 0 && _y == 0 && _z == 0
->         in forM_ (unBlocks $ translate _x _y _z blocks) $ \(Block Coord{..} kind mstate) ->
+>         in forM_ (unBlocks $ translate _x _y _z blocks) $ \(Block Coord{..} kind mstate mdata) ->
 >           let shower a = if isRelative then "~" <> show a else show a
->           in hPutStrLn hnd $ printf "setblock %s %s %s %s[%s]"
->               (shower _x) (shower _y) (shower _z) kind (foldMap id mstate)
+>               textState = mstate
+>                 & Map.toList
+>                 & foldMap (\(k, v) -> [k <> "=" <> v])
+>                 & Text.intercalate ","
+>           in Text.hPutStrLn hnd $ Text.pack $ printf "setblock %s %s %s %s[%s]{%s}"
+>               (shower _x) (shower _y) (shower _z) kind textState (foldMap id mdata)
 >   where
 >     folderPath =
->       [ minecraftDir, "saves", levelName, "datapacks"
->       , "haskell", "data", "haskell",  "functions"
+>       [ saveDir, "datapacks"
+>       , "haskell", "data", "haskell", "functions"
 >       ]
 >     filePath = foldr @[] (</>) (functionName ++ ".mcfunction") folderPath
->     mcmetaFile = foldr1 @[] (</>)
->       [ minecraftDir, "saves", levelName, "datapacks"
->       , "haskell", "pack.mcmeta"
->       ]
+>     mcmetaFile = foldr1 @[] (</>) (take 4 folderPath <> ["pack.mcmeta"])
 >     packMcMeta = "{\"pack\": {\"pack_format\": 1, \"description\": \"Haskell functions\" } }"
 
-> renderToFlatpak = render "/home/benedict/.var/app/com.mojang.Minecraft/.minecraft/"
-> renderRelative name = renderToFlatpak "Haskell" name (Coord 0 0 0)
+> renderRelative path name = render path name (Coord 0 0 0)
+> renderToFlatpak = renderRelative "/home/benedict/.var/app/com.mojang.Minecraft/.minecraft/saves/Haskell/"
+> renderToServer = renderRelative "/home/benedict/.minecraft/haskell/world/"
 
 To render our square turret, first load Minecraft, then enter the level you have the datapack installed into and then press F3 to find your current coordinates. You can then give `render` these coordinates at the haskell prompt:
 
@@ -351,7 +381,7 @@ A square turret obviously works well in Minecraft, but I wondered how effective 
 
 > circle :: Int -> Int -> Blocks
 > circle r steps = translate r 0 r $
->     mkBlocks [ (Coord x 0 z, Nothing)
+>     mkBlocks [ (Coord x 0 z, mempty)
 >              | s <- [1..steps]
 >              , let phi = (2*pi*fromIntegral s) / fromIntegral steps :: Double
 >                    z   = round $ fromIntegral r * cos phi
@@ -366,7 +396,7 @@ Note that the number of steps can be varied, with low values being useful for ci
 
 > circleFloor :: Int -> Blocks
 > circleFloor r = translate r 0 r $
->     mkBlocks [ (Coord x 0 z, Nothing)
+>     mkBlocks [ (Coord x 0 z, mempty)
 >              | x <- [-r..r]
 >              , z <- [-r..r]
 >              , let d = sqrt (fromIntegral $ x*x + z*z) :: Double
@@ -386,7 +416,7 @@ It would be nice to also create a staircase inside the circular turret, which we
 
 > spiral :: Int -> Int -> Int -> Int -> Int -> Blocks
 > spiral r start h revs steps = translate r 0 r $
->     mkBlocks [ (Coord x y z, Nothing)
+>     mkBlocks [ (Coord x y z, mempty)
 >              | s   <- [1..steps]
 >              , let phi = (2*pi*fromIntegral (revs*s)) / fromIntegral steps :: Double
 >                    z   = round $ fromIntegral r * cos phi
@@ -415,50 +445,56 @@ Example: wideSpiral 30 30 50 3 1000
 >   ]
 >   where
 >   nubber bs =
->     let tops = filter ((== Just "type=top") <<< view blockState) bs
->         bottoms = filter ((== Just "type=bottom") <<< view blockState) bs
+>     let tops = filter ((== Just "top") <<< Map.lookup "type" <<< view blockState) bs
+>         bottoms = filter ((== Just "bottom") <<< Map.lookup "type" <<< view blockState) bs
 >     in List.unionBy (\a b -> view blockCoord a == view blockCoord b) bottoms tops
 >   slabSpiral :: Int -> Int -> Int -> Int -> Blocks
->   slabSpiral r h revs steps = translate r 0 r $
->     mkBlocks [ (Coord x y z, state)
->              | s   <- [1..steps]
->              , let phi = (2*pi*fromIntegral (revs*s)) / fromIntegral steps :: Double
->                    z = round $ fromIntegral r * cos phi
->                    x = round $ fromIntegral r * sin phi
->                    y' = fromIntegral (h*s) / (fromIntegral steps :: Double)
->                    y = Prelude.floor y'
->                    state = Just $ mappend "type=" if mod' y' 1.0 >= 0.5 then "top" else "bottom"
->              ] # slabify smooth_stone
+>   slabSpiral r h revs steps = translate r 0 r $ mkBlocks
+>       [ (Coord x y z, state)
+>       | s   <- [1..steps]
+>       , let phi = (2*pi*fromIntegral (revs*s)) / fromIntegral steps :: Double
+>             z = round $ fromIntegral r * cos phi
+>             x = round $ fromIntegral r * sin phi
+>             y' = fromIntegral (h*s) / (fromIntegral steps :: Double)
+>             y = Prelude.floor y'
+>             state = Map.singleton "type" if mod' y' 1.0 >= 0.5 then "top" else "bottom"
+>       ] # slabify smooth_stone
 
 > spirograph (fromIntegral -> bigR) (fromIntegral -> r) (fromIntegral -> a) steps =
->   mkBlocks [ (Coord x 0 z, Nothing)
->            | t <- [1..steps]
->            , let z = round $ (bigR - r) * cos (r/bigR * t) + a * cos ((1-r/bigR) * t)
->                  x = round $ (bigR - r) * sin (r/bigR * t) - a * sin ((1-r/bigR) * t)
->            ]
+>   mkBlocks $ Vector.fromList
+>     [ (Coord x 0 z, mempty)
+>     | t <- [1..steps]
+>     , let z = round $ (bigR - r) * cos (r/bigR * t) + a * cos ((1-r/bigR) * t)
+>           x = round $ (bigR - r) * sin (r/bigR * t) - a * sin ((1-r/bigR) * t)
+>     ]
 
 > spirograph3d (fromIntegral -> bigR) (fromIntegral -> r) (fromIntegral -> a) t (fromIntegral -> h) revs steps =
->   mkBlocks [ (Coord x' y z', Nothing)
->            | s <- fromIntegral <$> [1 .. steps]
->            , w <- fromIntegral <$> [-t .. t]
->            , let y = round $ (h * s) / dSteps
->                  z = (bigR - r) * cos (r/bigR * s) + a * cos ((1-r/bigR) * s)
->                  x = (bigR - r) * sin (r/bigR * s) - a * sin ((1-r/bigR) * s)
->                  phi' = 2 * pi * (fromIntegral y/h)
->                  x' = round $ w + (x * cos phi' + z * sin phi')
->                  z' = round $ w + (z * cos phi' - x * sin phi')
->            ]
+>   mkBlocks $ Vector.fromList
+>     [ (Coord x' y z', mempty)
+>     | s <- fromIntegral <$> [1 .. steps]
+>     , w <- fromIntegral <$> [-t .. t]
+>     , let y = round $ (h * s) / dSteps
+>           z = (bigR - r) * cos (r/bigR * s) + a * cos ((1-r/bigR) * s)
+>           x = (bigR - r) * sin (r/bigR * s) - a * sin ((1-r/bigR) * s)
+>           phi' = 2 * pi * (fromIntegral y/h)
+>           x' = round $ w + (x * cos phi' + z * sin phi')
+>           z' = round $ w + (z * cos phi' - x * sin phi')
+>     ]
 >   where
 >     dSteps :: Double
 >     dSteps = fromIntegral steps
 
-> weed r steps =
->   mkBlocks [ (Coord x 0 z, Nothing)
->            | s <- fromIntegral <$> [1 .. steps]
->            , let t = 2 * pi / fromIntegral steps * s - pi
->                  z = round $ (1 + 0.9 * cos (8 * t)) * (1 + 0.1 * cos (24 * t))
->                  x = round $ r * (0.9 + 0.05 * cos (200 * t)) * (1 + sin t)
->            ]
+-- Misc
+
+> bed :: Text -> Blocks
+> bed facing = mconcat
+>   [ zero # "white_bed" & mapBlocks (set blockState $ Map.singleton "facing" facing)
+>   , zero # "white_bed"
+>       & mapBlocks (set blockState $ Map.fromList [("part", "head"), ("facing", facing)])
+>       & move x 1
+>   ] & angleBlocks 0 deg 0
+>   where
+>     deg = numericDirection facing
 
 My circular turret with a spiral staircase, crenellations, windows and a top floor with exit hole was thus:
 
@@ -511,10 +547,10 @@ Grid Layouts
 
 There are a whole host of layout combinators that we could imagine being useful, however for castles, a grid layout combinator should probably suffice. My implementation is:
 
-> grid :: Int -> [[Blocks]] -> Blocks
-> grid spacing = f z . map (f x . map centre_xz)
+> grid :: Int -> Vector (Vector Blocks) -> Blocks
+> grid spacing = f z . fmap (f x . fmap centre_xz)
 >   where
->     f :: Dimension -> [Blocks] -> Blocks
+>     f :: Dimension -> Vector Blocks -> Blocks
 >     f d = foldr (\a b -> a <> move d spacing b) mempty
 
 Note that each grid item is centered horizontally on the origin before it is moved into position.
@@ -530,8 +566,8 @@ The castle keep is a large fortified building in the centre of the grounds. We'l
 >     [ floors
 >     , squareWall w h
 >     , move y h (squareCrenellations w)
->     , grid (w-1) [ [ t,  t]
->                  , [ t,  t]
+>     , grid (w-1) [ [t,  t]
+>                  , [t,  t]
 >                  ]
 >     -- make a larger archway from default stone that juts out,
 >     -- before overlaying the smaller empty space one.
@@ -551,17 +587,31 @@ The archway was tricky to do. I started by defining some simple right-angle rota
 > rotate_x = mapBlocks $ over blockCoord $ \(Coord x y z) -> Coord x z y
 > rotate_y = mapBlocks $ over blockCoord $ \(Coord x y z) -> Coord y x z
 
-X,Z rotation to a degree angle.
+3D rotation.
 
-> angleCoord :: Int -> Coord -> Coord
-> angleCoord deg (Coord x y z) =
->   let theta = fromIntegral deg * (pi / 180)
->       x' = round $ cos theta * fromIntegral x + sin theta * fromIntegral x
->       z' = round $ negate (sin theta) * fromIntegral z + cos theta * fromIntegral z
->   in Coord x' y z'
+> angle :: Int -> Int -> Int -> Coord Int -> Coord Int
+> angle (fromIntegral -> degX') (fromIntegral -> degY') (fromIntegral -> degZ') =
+>   overDouble (xrot >>> yrot >>> zrot)
+>
+>   where
+>     xrot (Coord x' y' z') =
+>       Coord x' (y' * cos degX + z' * (-sin degX)) (y' * sin degX + z' * cos degX)
+>     yrot (Coord x' y' z') =
+>       Coord (x' * cos degY + z' * sin degY) y' (x' * (-sin degY) + z' * cos degY)
+>     zrot (Coord x' y' z') =
+>       Coord (x' * cos degZ + y' * (-sin degZ)) (x' * sin degZ + y' * cos degZ) z'
 
-> angle :: Int -> Blocks -> Blocks
-> angle deg = mapBlocks $ over blockCoord (angleCoord deg)
+>     degX = pi / 180 * degX'
+>     degY = pi / 180 * degY'
+>     degZ = pi / 180 * degZ'
+>
+>     overDouble :: (Coord Double -> Coord Double) -> Coord Int -> Coord Int
+>     overDouble f (Coord (fromIntegral -> x') (fromIntegral -> y') (fromIntegral -> z')) =
+>       let (Coord x'' y'' z'') = f $ Coord x' y' z'
+>       in (Coord (round x'') (round y'') (round z''))
+
+> angleBlocks :: Int -> Int -> Int -> Blocks -> Blocks
+> angleBlocks degX degY degZ = mapBlocks $ over blockCoord $ angle degX degY degZ
 
 An archway can then be made by rotating the circular floor and replicating it to achieve thickness:
 
@@ -588,7 +638,7 @@ The most important component of a English castle is the outer castle wall, so I 
 >     , translate 1 (h-1) 1 (wideSquare 2 (w-2))   -- roof
 >     , translate (-1) (h-1) (-1)
 >         (squareWall (w+2) 2 <> move y 2 (squareCrenellations (w+2))) -- overhangs
->     , translate 3 h 3 (square (w-6) # oak_fence)  -- wall top fencing
+>     , translate 3 h 3 (square z (w-6) # oak_fence)  -- wall top fencing
 >     -- since the wall is hollow we make a larger archway section
 >     -- out of default stone before we overlay the smaller empty space one
 >     , translate (w `div` 2) 0 (w-3) $ centre x $ archway 5 2
@@ -601,9 +651,9 @@ To create the final full castle, we start with the castle wall and then surround
 > englishCastle = mconcat
 >     [ castleWall w h
 >     , grid (w `div` 2)
->         [ [ t,  t,  t]
->         , [ t,  k,  t]
->         , [ t,  g,  t]
+>         [ [t,  t,  t]
+>         , [t,  k,  t]
+>         , [t,  g,  t]
 >         ]
 >     ]
 >   where
@@ -664,29 +714,30 @@ A desert castle would be made of sandstone rather then cobblestone, thus we need
 
 ![Desert Castle](../img/minecraft/desert_castle.png "Desert Castle")
 
-> stairs :: Int -> Int -> String -> Blocks
-> stairs start end direction = take (end - start) (iterate succ start) & foldMap ascend
+> mkStairs :: Int -> Int -> Blocks -> Blocks
+> mkStairs start end block = take (end - start) (iterate succ start) & foldMap ascend
 >   where
->   ascend a = mapBlocks (set blockState (Just $ "facing=" <> direction)) (line x 1)
->     & subst (cobblestone, quartz_stairs)
->     & translate a a 0
+>   ascend a = block & translate a a 0
 
-> plazaSkyscraper :: Int -> Int -> Int -> Int -> Blocks
-> plazaSkyscraper plazaRadius floors circum height = mconcat
+> stairs start end direction = mkStairs start end $ line x 1 # quartz_stairs
+>   & mapBlocks (set blockState $ Map.singleton "facing" direction)
+
+> plazaSkyscraper :: Int -> Int -> Int -> Int -> Maybe Data -> Blocks
+> plazaSkyscraper plazaRadius floors circum height danger = mconcat
 >   [ replicate y 1 10 (wideSquare plazaRadius (circum + plazaRadius * 2)) # air
 >   , wideSquare plazaRadius (circum + plazaRadius * 2) # smooth_stone
->   , skyscraper floors circum height & translate plazaRadius 0 plazaRadius
+>   , skyscraper floors circum height danger & translate plazaRadius 0 plazaRadius
 >   ]
 
-> skyscraper :: Int -> Int -> Int -> Blocks
-> skyscraper floors circum height =
+> skyscraper :: Int -> Int -> Int -> Maybe Data -> Blocks
+> skyscraper floors circum height danger =
 >   mkFloors floors circum height
 >     <> mkGround circum 4 4
 >     <> mkRoof floors circum height
 >
 >   where
 >     mkGround :: Int -> Int -> Int -> Blocks
->     mkGround r w h = foldMap @[] id $ foldMap @[] id $
+>     mkGround r w h = foldMap @Vector id $ foldMap @Vector id $
 
 Entrance openings
 
@@ -694,47 +745,29 @@ Entrance openings
 >         , wall z w h & translate r 1 (subtract 2 $ r `div` 2)
 >         ] <&> (# air)
 
-Slabs for the entrances
-
->       , [ line x w & translate (r `div` 2) 0 (-1)
->         , line z w & translate (-1) 0 (r `div` 2)
->         , line x w & translate (r `div` 2) 0 (succ r)
->         , line z w & translate (succ r) 0 (r `div` 2)
->         ] <&> subst (cobblestone, slabify smooth_stone)
-
 Add the ground flooring.
 
 >       , [ floor r r
 >         ] <&> subst (cobblestone, smooth_stone)
 >       ]
 >
->     mkRoof n r h = foldMap @[] id $
->       [ replicate y 1 3 (square (succ r) # smooth_stone)
+>     mkRoof n r h = foldMap @Vector id $
+>       [ replicate y 1 3 (square z (succ r) # smooth_stone)
 >       , floor (r - 1) (r - 1) # grass_block & translate 1 1 1
 >       , floor (h + 2) 3 # smooth_stone & translate 3 1 1
 >       , floor h 2 # air & translate 4 1 1
 >       , replicate z 1 2 (stairs 0 1 "east" # quartz_stairs) & translate (h + 3) 1 1
 >       , zero # "acacia_sapling"
 >           & translate (r `div` 2) 2 (r `div` 2)
->           & mapBlocks (set blockState $ Just "stage=1")
+>           & mapBlocks (set blockState $ Map.singleton "stage" "1")
 >       ] <&> move y (n * h)
 >
 >     mkFloor :: Int -> Int -> Blocks
->     mkFloor r h = foldMap @[] id $ foldMap @[] id
+>     mkFloor r h = foldMap @Vector id $ foldMap @Vector id
 >       [ [ wall x r h
 >         , wall z r h
 >         , wall x (succ r) h & move z r
 >         , wall z (succ r) h & move x r
-
-Carpet.
-
->         , floor (pred r) (pred r)
->             & translate 1 1 1
->             & subst (cobblestone, light_gray_carpet)
-
-No carpet on stairs.
-
->         , floor (h-1) 2 & translate 4 1 1 & subst (cobblestone, air)
 
 Ceiling.
 
@@ -751,42 +784,61 @@ Windows!
 
 We make some ceiling lights out of glowstones, as repeating hollow squares.
 
->       , takeWhile (>0) (iterate (subtract 10) (r - 4)) <&> \radius -> foldMap @[] id
->           [ square radius
+>       , takeWhile (>0) (iterate (subtract 10) (r - 4)) & foldMap \radius ->
+>           [ square z radius # (if isJust danger then redstone_lamp else glowstone)
 >               & translate (subtract radius r `div` 2) h (subtract radius r `div` 2)
->               & subst (cobblestone, glowstone)
 
 We cover the ceiling lights next.
 
->           , wideSquare 1 radius
+>           , wideSquare 1 radius # white_stained_glass
 >               & translate (subtract radius r `div` 2) (h - 1) (subtract radius r `div` 2)
->               & subst (cobblestone, white_stained_glass)
 >           ]
 
-Stairs! And space for the stairs.
+Make space/air above the stairs in the shape of stairs.
 
->       , [ [0 .. 2] & foldMap @[] \n ->
->             floor (h-1) 2 & translate 4 (h-n) 1 & subst (cobblestone, air)
->         , wall x (h - 2) h & translate 4 0 3 & subst (cobblestone, smooth_stone)
->         , stairs 1 (succ h) "east" & translate 2 0 1
->         , stairs 1 (succ h) "east" & translate 2 0 2
+>       , [ replicate z 1 2
+>             $ replicate y 1 6 (stairs 1 (succ h) "east" # air & mapBlocks (set blockState mempty))
+>                 & translate 1 0 1
+
+Carpet.
+
+>         , floor (pred r) (pred r) # light_gray_carpet
+>             & translate 1 1 1
+
+DangER
+
+>         , zero # "spawner"
+>             & translate (circum `div` 2) 1 (circum `div` 2)
+>             & mapBlocks (set blockData $ mkEntity <$> danger <*> pure 0.4)
+
+Stairs
+
+>         , replicate z 1 2 (stairs 1 (succ h) "east") & translate 2 0 1
+
+WALL
+
+>         , wall x (h - 2) h # smooth_stone & translate 4 0 3
+
+No carpet on stairs.
+
+>         , floor (h-1) 2 # air & translate 4 1 1
 >         ]
 >       ]
 >
 >     mkFloors n r h =
->       let ys = scanl (+) 0 (List.replicate (pred n) h)
->       in foldMap @[] (\y' -> mkFloor r h & move y y') ys
+>       let ys = Vector.scanl (+) 0 (Vector.replicate (pred n) h)
+>       in ys & foldMap @Vector \y' -> mkFloor r h & move y y'
 
-> plazaRoundSkyscraper :: Int -> Int -> Int -> Int -> Blocks
-> plazaRoundSkyscraper plazaRadius radius floors height = mconcat
+> plazaRoundSkyscraper :: Int -> Int -> Int -> Int -> Maybe Data -> Blocks
+> plazaRoundSkyscraper plazaRadius radius floors height danger = mconcat
 >   [ replicate y 1 10 (floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius))) # air
->   , floor (2 * (plazaRadius + radius)) (2 * (plazaRadius + radius)) # smooth_stone
->   , roundSkyscraper radius floors height
+>   , floor (2 * (plazaRadius + radius) + 1) (2 * (plazaRadius + radius) + 1) # smooth_stone
+>   , roundSkyscraper radius floors height danger
 >       & translate plazaRadius 0 plazaRadius
 >   ]
 
-> roundSkyscraper :: Int -> Int -> Int -> Blocks
-> roundSkyscraper radius floors height = mconcat
+> roundSkyscraper :: Int -> Int -> Int -> Maybe Data -> Blocks
+> roundSkyscraper radius floors height danger = mconcat
 
 Cool black glass exterior.
 
@@ -794,7 +846,7 @@ Cool black glass exterior.
 
 Every floor's flooring
 
->   , [0, height .. floors * height] & foldMap @[] \n -> circleFloor' radius # smooth_stone & move y n
+>   , [0, height .. floors * height] & foldMap @Vector \n -> circleFloor' radius # smooth_stone & move y n
 
 Roof?
 
@@ -802,24 +854,33 @@ Roof?
 
 Carpet!
 
->   , [0, height .. floors * height - height] & foldMap @[] \n -> circleFloor' (radius - 1) # light_gray_carpet & translate 1 (succ n) 1
+>   , [0, height .. floors * height - height] & foldMap @Vector \n -> circleFloor' (radius - 1) # light_gray_carpet & translate 1 (succ n) 1
+
+Every floor's DANGER
+
+>   , guard (isJust danger) do
+>       replicate y height floors zero # "spawner"
+>         & translate radius 1 radius
+>         & mapBlocks (set blockData $ mkEntity <$> danger <*> pure 0.4)
 
 Spiral staircase.
 
 >   , wideSlabSpiral (radius - 1) 3 (floors * height) (floors `div` 2) (radius * 4 * 3 * floors)
 >       & translate 1 1 1
->       & overN @Blocks @[Block] \blocks -> flip (foldMap @[]) blocks \block ->
->           let space = take 3 (iterate succ 1) <&> \n ->
->                 over blockCoord (over y (+n)) block
->                   & over blockKind (const air)
->                   & over blockState (const Nothing)
+>       & overN @Blocks @(Vector Block) \blocks -> flip (foldMap @Vector) blocks \block ->
+>           let space = take 3 (iterate succ 1) & foldMap \n ->
+>                 pure $ over blockCoord (over y (+n)) block
+>                   & set blockKind air
+>                   & set blockState mempty
 >           in space <> [block]
 
 Ceiling lights.
 
->   , [height, height * 2 .. floors * height] & foldMap @[] \y' ->
->       takeWhile (>0) (iterate (subtract 5) (radius - 5)) & foldMap @[] \r -> mconcat
->         [ circle r (r * 2 * 4) # glowstone & move y y'
+>   , [height, height * 2 .. floors * height] & foldMap @Vector @Blocks \y' ->
+>       takeWhile (>0) (iterate (subtract 5) (radius - 5)) & foldMap @[] @Blocks \r -> mconcat
+>         [ circle r (r * 2 * 4)
+>             # (if isJust danger then redstone_lamp else glowstone)
+>             & move y y'
 >         , circle r (r * 2 * 4) # white_stained_glass & move y (pred y')
 >         ] & translate (radius - r) 0 (radius - r)
 
@@ -828,6 +889,17 @@ Entrances
 >   , wall z (radius `div` 4 + 1) (height - 3) # air & translate 0 1 (radius - 1)
 >   , replicate y 1 2 (circle radius (radius * 2 * 6) # smooth_stone) & move y (floors * height + 1)
 >   ]
+
+> plazaGreenery plazaR width length = mconcat
+>   [ wideRect plazaR (width + plazaR * 2) (length + plazaR * 2) # smooth_stone
+>   , greenery & translate plazaR 0 plazaR
+>   ]
+>   where
+>   greenery = mconcat
+>     [ floor width length # grass_block
+>     , replicate z 8 (length `div` 8) (zero # "acacia_sapling") & translate (width `div` 2) 1 4
+>     , replicate z 8 (length `div` 8) (zero # glowstone) & translate (width `div` 2) 0 8
+>     ]
 
 > plazaPool plazaR width length depth = mconcat
 >   [ cube (length + plazaR * 2) 10 (width + plazaR * 2) # air
@@ -839,16 +911,152 @@ Entrances
 > pool width length depth = mconcat
 >   [ cube (length + 2) (depth + 1) (width + 2) # smooth_stone & move y (-depth)
 >   , cube length depth width # "water" & translate 1 (-(depth - 1)) 1
+>   , replicate x length 2 $ replicate z width 2 $ zero # glowstone & move y (-depth)
 >   ]
+
+> stairGrid :: Int -> Int -> Int -> Blocks
+> stairGrid n m = stepDown
+>   where
+>     stepDown :: Int -> Blocks
+>     stepDown c
+>       | c <= 0 = mempty
+>       | otherwise = square y n <> (stepDown (pred c) & oddOffset c)
+>     oddOffset o
+>       | o `mod` 2 == 0 = translate (n - 1) (m - 1) 0
+>       | otherwise = translate (m - 1) (n - 1) 0
+
+> plazaTreeHouse :: Int -> Int -> Int -> Blocks
+> plazaTreeHouse plazaR height side = mconcat
+>   [ floor plazaSize plazaSize # smooth_stone
+>   , cube plazaSize 10 plazaSize # air & move y 1
+>   , treeHouse height side & translate plazaR 0 (((plazaSize - (side + 10)) `div` 2) + 5)
+>   ]
+>   where
+>     plazaSize = plazaR * 2 + side * 2 + div side 3
+
+> treeHouse :: Int -> Int -> Blocks
+> treeHouse height side = shaveBlocks ((< height) . view y) bridgedTowers
+>   where
+>     bridgeWidth = side `div` 3
+>     doorWidth = bridgeWidth
+>     shaveBlocks p = overN $ Vector.filter $ p <<< view blockCoord
+>     wallGrid = stairGrid
+>       (round $ fromIntegral side * 0.555)
+>       (round $ fromIntegral side * 0.555 * (1/3))
+>       (succ $ ceiling $ fromIntegral height / (fromIntegral side / 2))
+>         # quartz_block
+>         & angleBlocks 0 0 45
+>         & \blocks -> blocks & move x (succ $ abs $ fst $ bounds x blocks)
+>     wallSide = mconcat
+>       [ wall x side height # "jungle_leaves" & mapBlocks (set blockState $ Map.singleton "persistent" "true")
+>       , wallGrid
+>       ]
+>     wallInner = wall x (side - 2) height # quartz_block
+>     roof = mconcat
+>       [ floor (side - 4) (side - 4) # white_stained_glass & translate 2 (height - 1) 2
+>       , [ 0, 1 ] & foldMap @Vector \n -> rect (side - n * 2) (side - n * 2) # quartz_block & translate n (height - 1) n
+>       , replicate x (side - 3) 2 (replicate z (side - 3) 2 $ line x 1 # glowstone) & translate 1 (height - 1) 1
+>       ]
+>     staircase = mconcat
+>       [ replicate z 1 2 (stairs 1 5 "east" # quartz_stairs)
+>           & copyBlocks \stairs' -> stairs'
+>               & angleBlocks 0 180 0
+>               & translate 5 4 (-1)
+>               & mapBlocks (set blockState $ Map.singleton "facing" "west")
+>       , mconcat
+>           [ mkStairs 1 5 (line x 1 # quartz_block)
+>           , mkStairs 1 5 (line x 1 # white_stained_glass_pane) & move y 1
+>           , mkStairs 0 4 (line x 1 # white_stained_glass_pane) & move y 2
+>           ]
+>             & angleBlocks 0 180 0
+>             & translate 5 4 (-3)
+>       , floor 3 5 # quartz_block & translate 5 4 (-3)
+>       , line x 3 # glowstone & translate 5 4 2
+>       , line x 3 # white_stained_glass_pane & translate 5 5 (-3)
+>       , line z 4 # white_stained_glass_pane & translate 7 5 (-2)
+>       ]
+>     tower = mconcat
+>       [ mconcat
+>           [ replicate z (side - 1) 2 wallSide
+>           , wallSide & angleBlocks 0 270 0 & move x (side - 1)
+>           , wall z side height # white_stained_glass
+>           ]
+>       , mconcat
+>           [ replicate x (side - 1) 2 $ line y height
+>           , replicate x (side - 1) 2 (line y height) & move z (side - 1)
+>           ] # quartz_block
+>       , mconcat
+>           [ replicate z (side - 3) 2 wallInner
+>           , wallInner & angleBlocks 0 270 0 & move x (side - 3)
+>           ] & translate 1 0 1
+>       , replicate y 8 (height `div` 8) $ mconcat
+>           [ floor (side - 5) (side - 6) # quartz_block & translate 2 0 3
+>           , rect (side - 3) (side - 4) # glowstone & translate 1 0 2
+>           , rect (side - 5) (side - 6) # quartz_slab & translate 2 1 3
+>           , rect (side - 5) (side - 6) # quartz_block & translate 2 7 3
+>           , line z side # quartz_block
+>           , replicate z 1 2 (bed "west" # "black_bed") & translate 4 1 (side `div` 2)
+>           ]
+>       , roof
+>       ] & shaveBlocks \(Coord x' y' z') -> and @Vector $ ($) <$> [(>= 0), (< side)] <*> [x', z']
+>     bridge = mconcat
+>       [ replicate y 8 (height `div` 8) $ mconcat
+>           [ floor (side `div` 3) (side + 10) # quartz_block
+>               & move z (-5)
+>           , mconcat
+>               [ line x (side `div` 3) # white_stained_glass_pane & translate 0 1 (-5)
+>               , replicate x (div side 3 - 1) 2 (line z 5 # white_stained_glass_pane) & translate 0 1 (-4)
+>               ] & copyBlocks \glass -> glass & angleBlocks 0 180 0 & translate (div side 3 - 1) 0 (side - 1)
+>           , cube (side `div` 3) 4 4 # air
+>               & translate (-4) 1 (div side 2 - div side 6)
+>               & \doors -> doors <> (doors & move x (bridgeWidth + 4))
+>           , rect 6 (doorWidth + 2) # quartz_block
+>               & angleBlocks 0 0 90
+>               & translate (-1) 0 (div side 2 - div doorWidth 2 - 1)
+>               & \doorFrame -> doorFrame <> (doorFrame & move x (bridgeWidth + 1))
+>           , floor (bridgeWidth + 6) doorWidth # quartz_block
+>               & translate (-3) 0 (div side 2 - div side 6)
+>           , replicate x (bridgeWidth + 5) 2 (replicate z (doorWidth + 1) 2 (line x 1 # quartz_slab))
+>               & translate (-3) 1 (div side 2 - div doorWidth 2 - 1)
+>           , mconcat
+>               [ line z (side - 2) # glowstone & translate (-1) 0 1
+>                   & \lights -> lights <> (lights & move x (bridgeWidth + 1))
+>               , line z doorWidth # quartz_block & translate (-1) 0 (div side 2 - div doorWidth 2)
+>                   & \doorFloor -> doorFloor <> (doorFloor & move x (bridgeWidth + 1))
+>               ]
+>           ]
+>       , replicate y 8 (div height 8 - 1) $ mconcat
+>           [ mconcat
+>               [ staircase
+>               , line z 5 # air & translate 0 1 (-2)
+>               , line z 2 # air & translate 0 9 (-2)
+>               ] & translate (div side 3 - 1) 0 (-2)
+>           , mconcat
+>               [ staircase
+>               , line z 5 # air & translate 0 1 (-2)
+>               , line z 2 # air & translate 0 9 (-2)
+>               ] & angleBlocks 0 180 0
+>                 & translate 0 0 (succ side)
+>                 & mapBlocks (mapFacing $ textualDirection . (+180) . numericDirection)
+>           ]
+>       ] & move x side
+>     bridgedTowers = mconcat
+>       [ tower
+>       , tower
+>           & angleBlocks 0 180 0
+>           & translate (side * 2 - 1 + side `div` 3) 0 (side - 1)
+>           & mapBlocks (mapFacing $ textualDirection . (+180) . numericDirection)
+>       , bridge
+>       ]
 
 > street :: Int -> Int -> Blocks
 > street length lanes | lanes == 1 = floor 3 length & subst (cobblestone, gray_concrete)
 > street length lanes = mconcat
 >   [ sidewalk
->   , foldl @[] mkLanes mempty [1 .. lanes]
+>   , foldl @Vector mkLanes mempty [1 .. lanes]
 >   , floor 1 length & translate ((lanes * 4 + 8) `div` 2) 0 0 & subst (cobblestone, white_concrete)
 >   , sidewalk & translate (lanes * 4 + 4) 0 0
->   , zero & translate 1 0 1 & subst (air, iron_trapdoor) & mapBlocks (set blockState (Just "half=top"))
+>   , zero # iron_trapdoor & translate 1 0 1 & mapBlocks (set blockState $ Map.singleton "half" "top")
 >   , cube 3 3 3 & translate 0 (-3) 0
 >   , wall x 3 3 & translate 0 (-6) 2
 >   , line y 6 # ladder & translate 1 (-6) 1
@@ -866,7 +1074,7 @@ Entrances
 >     ]
 >
 >   lane = floor 3 length & subst (cobblestone, gray_concrete)
->   striped = takeWhile (<= length) [0, 3 .. ] & foldMap \n ->
+>   striped = List.takeWhile (<= length) [0, 3 .. ] & foldMap \n ->
 >     floor 1 (min 3 (length - n))
 >       & translate 0 0 n
 >       & subst ( cobblestone
@@ -874,11 +1082,11 @@ Entrances
 >                 then gray_concrete
 >                 else white_concrete
 >               )
->   lamps = takeWhile (<= length) [4, 12 .. ] & foldMap \n ->
+>   lamps = List.takeWhile (<= length) [4, 12 .. ] & foldMap \n ->
 >     mconcat
 >       [ line y 4 # iron_bars & translate 0 1 0
 >       , zero # redstone_lamp & translate 0 5 0
->       , zero # daylight_detector & translate 0 6 0 & mapBlocks (set blockState (Just "inverted=true"))
+>       , zero # daylight_detector & translate 0 6 0 & mapBlocks (set blockState $ Map.singleton "inverted" "true")
 >       ] & translate 2 0 n
 >   sidewalk = mconcat
 >     [ cube length 10 5 # air
@@ -892,54 +1100,119 @@ Entrances
 >   generateCity' :: Int -> State.StateT Blocks IO ()
 >   generateCity' 0 = pure ()
 >   generateCity' n = do
+
+We rotate the street to any cardinal direction (N/E/S/W) randomly
+
 >     d <- IO.liftIO $ (90*) <$> randomRIO @Int (0, 3)
 >     roadLength <- IO.liftIO $ randomRIO @Int (50, 500)
 >     roadLanes <- IO.liftIO $ (2*) <$> randomRIO @Int (2, 4)
 
 Add a street which we build around.
 
->     State.modify $ mappend $ angle d $ street roadLength roadLanes
->     let Coord roadX _ roadZ =
->           angleCoord d $ Coord (4 * roadLanes - 1 + 10) 0 roadLength
->     structureSizes <- IO.liftIO $ Loops.iterateUntilM
->       (sum >>> (> roadLength - 75))
->       (\xs -> (:xs) <$> randomRIO (25, 75))
->       []
->     IO.liftIO $ print @[Int] structureSizes
->     void $ flip (`foldM` 0) structureSizes \acc size -> do
->       structureZero <- IO.liftIO $ join $ ($ size) <$> randomStructure
->       let structure = structureZero & translate (-size) 0 acc & angle d
+>     State.modify $ mappend $ angleBlocks 0 d 0 $ street roadLength roadLanes
+>     let mkStructureSizes = IO.liftIO $ Loops.iterateUntilM
+>           (sum >>> (> roadLength - 75))
+>           (\xs -> (:xs) <$> randomRIO (25, 75))
+>           []
+>     leftStructureSizes <- mkStructureSizes
+>     rightStructureSizes <- mkStructureSizes
+>     IO.liftIO $ print (leftStructureSizes, rightStructureSizes)
+>     void $ flip (`foldM` 0) leftStructureSizes \acc size -> do
+>       structureZero <- IO.liftIO $ join $ (\f -> f size d) <$> randomStructure
+>       let structure = structureZero & translate (-size) 0 acc & angleBlocks 0 d 0
 >       State.modify $ mappend structure
 >       pure (acc + size)
->   randomStructure :: IO (Int -> IO Blocks)
->   randomStructure = (structures !!) <$> randomRIO (0, length structures - 1)
->   structures :: [Int -> IO Blocks]
+>     void $ flip (`foldM` 0) rightStructureSizes \acc size -> do
+>       let d' = (d + 180) `mod` 360
+>       structureZero <- IO.liftIO $ join $ (\f -> f size d') <$> randomStructure
+>       let xDelta = uncurry subtract $ bounds x structureZero
+>       let zDelta = uncurry subtract $ bounds z structureZero
+>       let structure = structureZero & angleBlocks 0 d' 0
+>             & translate (negate $ size - xDelta + 4 * roadLanes - 9) 0 (negate $ acc + size - 1)
+>       -- State.modify $ mappend structure
+>       pure (acc + size)
+>   randomStructure :: IO (Int -> Int -> IO Blocks)
+>   randomStructure = (structures Vector.!) <$> pure 4 --randomRIO (0, length structures - 1)
+>   structures :: Vector (Int -> Int -> IO Blocks)
 >   structures =
->     [ \size -> do
+>     [ \size direction -> do
 >         plazaR <- randomRIO $ plazaRange size
+>         isDangerous <- randomRIO (False, True)
 >         plazaSkyscraper plazaR
 >           <$> randomRIO (5, 15)
 >           <*> pure (size - plazaR * 2)
 >           <*> randomRIO (5, 9)
+>           <*> (if isDangerous then fmap Just randomMonster else pure Nothing)
+>           <&> mapBlocks (mapFacing $ const $ textualDirection direction)
 >
->     , \size -> do
+>     , \size _ -> do
 >         plazaR <- randomRIO $ plazaRange size
+>         isDangerous <- randomRIO (False, True)
 >         plazaRoundSkyscraper plazaR
 >           <$> pure ((size - plazaR * 2) `div` 2)
 >           <*> randomRIO (5, 15)
 >           <*> randomRIO (5, 9)
+>           <*> (if isDangerous then fmap Just randomMonster else pure Nothing)
 >           <&> translate 1 0 0
 >
->     , \size -> do
+>     , \size _ -> do
 >         plazaR <- randomRIO $ plazaRange size
 >         width <- randomRIO (5, 10)
 >         plazaPool plazaR width
->           <$> pure ((size - plazaR * 2) `div` 2)
+>           <$> pure (size - plazaR * 2)
 >           <*> randomRIO (1, 2)
 >           <&> translate (size - (plazaR * 2 + width)) 0 0
+>
+>     , \size _ -> do
+>         plazaR <- randomRIO $ plazaRange size
+>         width <- randomRIO (5, 10)
+>         plazaGreenery plazaR width
+>           <$> pure (size - plazaR * 2)
+>           <&> translate (size - (plazaR * 2 + width)) 0 0
+>
+>     , \size direction -> do
+>         plazaR <- randomRIO (0, 2)
+>         height <- (8*) <$> randomRIO (5, 15)
+>         let side = round (fromIntegral size / (7/3)) - plazaR * 2
+>         pure $ plazaTreeHouse plazaR height side
+>           & mapBlocks (mapFacing $ textualDirection . (+ (direction + 270)) . numericDirection)
+>           & angleBlocks 0 270 0
+>           & move x (side*2 + (side `div` 3) + plazaR*2 - 1)
 >     ]
+>   randomMonster = do
+>     let monsters :: Vector Data
+>         monsters =
+>           [ "zombie"
+>           , "skeleton"
+>           , "pillager"
+>           , "evoker"
+>           , "ravager"
+>           , "silverfish"
+>           , "spider"
+>           , "vex"
+>           , "witch"
+>           ]
+>     n <- randomRIO (0, length monsters - 1)
+>     pure $ monsters Vector.! n
 >   plazaRange s = (5, s `div` 5)
 
+> textualDirection :: Int -> Text
+> textualDirection n = case round $ fromIntegral (n `mod` 360) / 90 of
+>   0 -> "east"
+>   1 -> "north"
+>   2 -> "west"
+>   3 -> "south"
+
+> numericDirection :: Text -> Int
+> numericDirection s = case s of
+>   "east" -> 0
+>   "north" -> 90
+>   "west" -> 180
+>   "south" -> 270
+>   _ -> error $ "Not a direction: " <> Text.unpack s
+
+> mapFacing :: (Text -> Text) -> Block -> Block
+> mapFacing f = over blockState $ Map.adjust f "facing"
 
 Have fun!
 
@@ -956,7 +1229,6 @@ Appendix
 
 > air = "air"
 > anvil = "anvil"
-> bed = "red_bed"
 > bookshelf = "bookshelf"
 > bricks = "bricks"
 > chair = "oak_stairs"
@@ -978,11 +1250,13 @@ Appendix
 > torch = "torch"
 > quartz_block = "quartz_block"
 > smooth_quartz = "smooth_quartz"
+> quartz_slab = "quartz_slab"
 > smooth_stone = "smooth_stone"
 > slabify = (<> "_slab")
 > quartz_stairs = "quartz_stairs"
 > glowstone = "glowstone"
 > white_stained_glass = "white_stained_glass"
+> white_stained_glass_pane = "white_stained_glass_pane"
 > light_gray_carpet = "light_gray_carpet"
 > grass_block = "grass_block"
 > gray_concrete = "gray_concrete"
